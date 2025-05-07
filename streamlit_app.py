@@ -1553,8 +1553,8 @@ with tab_financial:
     with st.expander("Cost Structure", expanded=True):
         st.markdown("### Monthly Cost Structure")
         
-        # Create a dataframe for cost data with your provided values
-        costs_data = {
+        # Define default cost structure data
+        default_costs_data = {
             "Expense": ["Rent", "Software", "Office", "Director Salaries (2x)", "Debt equity", 
                        "Engineer", "CMO", "Sales", "Freelance", "Legal", "Customer support"],
             "Monthly": [5000, 4000, 600, 25000, 75000, 16667, 8333, 8333, 8000, 0, 7500],
@@ -1563,16 +1563,60 @@ with tab_financial:
             "Contingency": ["25%", "200%", "5%", "25%", "0%", "20%", "20%", "20%", "25%", "25%", "20%"]
         }
         
-        costs_df = pd.DataFrame(costs_data)
+        # Create a session state key for the costs data if it doesn't exist
+        if 'costs_data' not in st.session_state:
+            st.session_state.costs_data = default_costs_data
         
-        # Calculate totals
-        monthly_total = sum(costs_data["Monthly"])
+        # Convert to DataFrame for editing
+        costs_df = pd.DataFrame(st.session_state.costs_data)
         
-        # Display the cost structure in a table
-        st.dataframe(costs_df)
+        # Create an editable dataframe
+        edited_costs_df = st.data_editor(
+            costs_df,
+            use_container_width=True,
+            num_rows="fixed",
+            column_config={
+                "Monthly": st.column_config.NumberColumn(
+                    "Monthly ($)",
+                    min_value=0,
+                    format="$%d"
+                ),
+                "Yearly": st.column_config.TextColumn(
+                    "Yearly ($)",
+                    help="Annual salary or cost (leave empty if monthly is used)"
+                ),
+                "Annual Growth": st.column_config.TextColumn(
+                    "Annual Growth",
+                    help="Expected annual growth rate"
+                ),
+                "Contingency": st.column_config.TextColumn(
+                    "Contingency",
+                    help="Buffer percentage for unexpected costs"
+                )
+            },
+            key="cost_structure_editor"
+        )
         
+        # Update the session state with the edited data
+        st.session_state.costs_data = {
+            "Expense": edited_costs_df["Expense"].tolist(),
+            "Monthly": edited_costs_df["Monthly"].tolist(),
+            "Yearly": edited_costs_df["Yearly"].tolist(),
+            "Annual Growth": edited_costs_df["Annual Growth"].tolist(),
+            "Contingency": edited_costs_df["Contingency"].tolist()
+        }
+        
+        # Calculate totals based on the edited data
+        monthly_total = sum(edited_costs_df["Monthly"])
+        
+        # Display totals
         st.metric("Total Monthly Burn (before revenue)", f"${monthly_total:,.2f}")
         st.metric("Total Annual Burn (before revenue)", f"${monthly_total*12:,.2f}")
+        
+        # Add a button to reset to default values
+        if st.button("Reset Cost Structure to Default"):
+            st.session_state.costs_data = default_costs_data
+            st.rerun()
     
     # Financial projections based on selected pricing model
     st.subheader("Revenue & Runway Projections")
