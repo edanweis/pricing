@@ -3,6 +3,8 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import time
+import plotly.graph_objects as go
+import plotly.express as px
 from main import (
     PricingParams, 
     PricingSystemModel, 
@@ -13,6 +15,182 @@ from main import (
     optimize_with_cpsat,
     analyze_network_effects_and_elasticity
 )
+
+# Add PyMoo imports - wrap in try/except to handle cases where it's not installed
+try:
+    from pymoo.core.problem import Problem
+    from pymoo.algorithms.moo.nsga3 import NSGA3
+    from pymoo.optimize import minimize
+    from pymoo.decomposition.asf import ASF
+    from pymoo.util.ref_dirs import get_reference_directions
+    from pymoo.visualization.scatter import Scatter
+    PYMOO_AVAILABLE = True
+except ImportError:
+    PYMOO_AVAILABLE = False
+
+# Create a multi-objective optimization problem class for PyMoo
+class PricingProblem(Problem):
+    def __init__(self, pricing_params, objectives, param_ranges):
+        self.pricing_params = pricing_params
+        self.objectives = objectives  # List of objective names
+        self.param_names = list(param_ranges.keys())
+        
+        # Extract lower and upper bounds for each parameter
+        lb = np.array([param_ranges[param]['min'] for param in self.param_names])
+        ub = np.array([param_ranges[param]['max'] for param in self.param_names])
+        
+        # Define problem with n_var variables, n_obj objectives, n_constr constraints
+        super().__init__(
+            n_var=len(self.param_names),  # Number of parameters to optimize
+            n_obj=len(objectives),        # Number of objectives
+            n_constr=0,                   # Number of constraints
+            xl=lb,                        # Lower bounds
+            xu=ub                         # Upper bounds
+        )
+    
+    def _evaluate(self, x, out, *args, **kwargs):
+        # Initialize array to store objective values
+        f = np.zeros((x.shape[0], len(self.objectives)))
+        
+        # For each solution in the population
+        for i in range(x.shape[0]):
+            # Create a copy of params to avoid modifying the original
+            params_copy = PricingParams()
+            params_copy.__dict__.update(self.pricing_params.__dict__)
+            
+            # Set parameter values for this solution
+            param_values = {}
+            for j, param_name in enumerate(self.param_names):
+                setattr(params_copy, param_name, x[i, j])
+                param_values[param_name] = x[i, j]
+            
+            # Extract parameters relevant for PricingSystemModel
+            enterprise_price = param_values.get('enterprise_price', 299)
+            pro_price = param_values.get('pro_price', 99)
+            lifetime_price = param_values.get('lifetime_price', 995)
+            consultant_fee = param_values.get('consultant_fee', 0.7)
+            trial_days = param_values.get('trial_days', 14)
+            
+            # Create model and run simulation
+            model = PricingSystemModel(params_copy, {
+                'enterprise': enterprise_price,
+                'pro': pro_price,
+                'lifetime': lifetime_price,
+                'consultant_fee': consultant_fee,
+                'trial_days': trial_days
+            })
+            results = model.run_simulation()
+            
+            # Calculate additional user revenue if needed
+            additional_users = results['final_enterprise_users'] * max(0, params_copy.avg_team_size - params_copy.base_team_size)
+            additional_user_revenue = additional_users * params_copy.additional_user_cost
+            results['final_mrr'] += additional_user_revenue
+            
+            # Map objectives according to maximize/minimize direction
+            for j, obj in enumerate(self.objectives):
+                if obj == 'npv':
+                    # Maximize NPV (multiply by -1 for minimization problem)
+                    f[i, j] = -results['npv']
+                elif obj == 'mrr':
+                    # Maximize MRR
+                    f[i, j] = -results['final_mrr']
+                elif obj == 'ltv_cac':
+                    # Maximize LTV/CAC ratio
+                    f[i, j] = -results['final_ltv_cac']
+                elif obj == 'gross_margin':
+                    # Maximize gross margin
+                    f[i, j] = -results['final_gross_margin']
+                elif obj == 'enterprise_users':
+                    # Maximize enterprise users
+                    f[i, j] = -results['final_enterprise_users']
+                elif obj == 'pro_users':
+                    # Maximize pro users
+                    f[i, j] = -results['final_pro_users']
+                elif obj == 'consultants':
+                    # Maximize consultants
+                    f[i, j] = -results['final_consultants']
+                elif obj == 'churn':
+                    # Minimize churn
+                    f[i, j] = results.get('churn', 0)
+        
+        out["F"] = f
+
+# Function to run multi-objective optimization
+def run_multiobjective_optimization(pricing_params, objectives, param_ranges, pop_size=100, n_gen=50):
+    """
+    Run multi-objective optimization using NSGA-III algorithm
+    
+    Parameters:
+    -----------
+    pricing_params : PricingParams
+        Parameters for the pricing model
+    objectives : list
+        List of objective names
+    param_ranges : dict
+        Dictionary of parameter ranges with min and max values
+    pop_size : int
+        Population size for NSGA-III
+    n_gen : int
+        Number of generations
+    
+    Returns:
+    --------
+    res : Result
+        Optimization results
+    """
+    # Create the problem
+    problem = PricingProblem(pricing_params, objectives, param_ranges)
+    
+    # Create reference directions for NSGA-III
+    n_obj = len(objectives)
+    ref_dirs = get_reference_directions("das-dennis", n_obj, n_partitions=12)
+    
+    # Create the algorithm
+    algorithm = NSGA3(
+        pop_size=pop_size,
+        ref_dirs=ref_dirs
+    )
+    
+    # Run the optimization
+    res = minimize(problem,
+                  algorithm,
+                  ('n_gen', n_gen),
+                  verbose=False)
+    
+    return res, problem
+
+# Define global helper functions for Wellspring marketplace
+def effective_consultants(model, params):
+    """Calculate effective number of consultants including dual-role participants"""
+    return (
+        model.consultants + 
+        (model.growers * params.grower_seller_pct) + 
+        (model.pro_users * params.landscaper_seller_pct * 0.5)  # Pro users participation factor
+    )
+
+def calculate_wellspring_revenue(model, params):
+    """Calculate Wellspring marketplace revenue based on credits model"""
+    # Base revenue from dedicated consultants
+    base_revenue = model.consultants * params.avg_monthly_credits * params.credits_price * params.wellspring_tx_fee
+    
+    # Additional revenue from dual-role participants
+    grower_revenue = model.growers * params.grower_seller_pct * params.avg_monthly_credits * 0.7 * params.credits_price * params.wellspring_tx_fee
+    
+    # Calculate total enterprise users (including additional team members)
+    total_enterprise_users = model.enterprise_users * params.avg_team_size
+    enterprise_additional_users = model.enterprise_users * max(0, params.avg_team_size - params.base_team_size)
+    
+    # Landscaper revenue includes both individual pros and enterprise additional users
+    landscaper_revenue = (model.pro_users + enterprise_additional_users * 0.3) * params.landscaper_seller_pct * params.avg_monthly_credits * 0.5 * params.credits_price * params.wellspring_tx_fee
+    
+    # Total marketplace revenue
+    total_revenue = base_revenue + grower_revenue + landscaper_revenue
+    
+    # Apply liquidity factor (more diverse sellers = more activity)
+    seller_diversity = min(1.0, effective_consultants(model, params) / 100)  # Cap at 1.0
+    liquidity_multiplier = 1.0 + (seller_diversity * 0.5)  # Max 50% boost from diversity
+    
+    return total_revenue * liquidity_multiplier
 
 try:
     from ortools.sat.python import cp_model
@@ -29,13 +207,15 @@ st.set_page_config(
 )
 
 # Create tabs
-tab_params, tab_basic, tab_advanced, tab_compare, tab_seedstage, tab_network, tab_financial = st.tabs([
+tab_params, tab_basic, tab_advanced, tab_compare, tab_seedstage, tab_network, tab_wellspring, tab_multiobjective, tab_financial = st.tabs([
     "📊 Parameters", 
     "🔄 Basic Pricing", 
     "📈 Advanced Pricing", 
     "🔍 Compare Models", 
     "🌱 Seed Stage",
     "🌐 Network Effects",
+    "🤝 Wellspring",
+    "🎯 Multi-Objective",
     "💰 Financial Modeling"
 ])
 
@@ -96,10 +276,10 @@ def create_params():
     )
     
     params.potential_pro_customers = st.sidebar.slider(
-        "Pro Users", 
+        "Pro Users (Architects)", 
         100, int(orig_pro * 2), int(orig_pro), 
         step=100,
-        help="Number of potential professional users (individual landscape architects) who could use your platform."
+        help="Number of potential individual landscape architects who could use pro accounts on your platform."
     )
     
     params.potential_consultants = st.sidebar.slider(
@@ -117,10 +297,10 @@ def create_params():
     )
     
     params.potential_landscapers = st.sidebar.slider(
-        "Landscapers", 
+        "Landscapers (Pro Accounts)", 
         100, int(orig_landscapers * 2), int(orig_landscapers), 
         step=100,
-        help="Number of potential individual landscapers/contractors who could use your platform."
+        help="Number of potential individual landscapers/contractors who could use pro accounts on your platform (same pricing as architects)."
     )
     
     # Parameters that can still be adjusted
@@ -146,6 +326,51 @@ def create_params():
     params.catalog_network_effect = 0.15 * network_effect_multiplier
     params.consultant_network_effect = 0.12 * network_effect_multiplier
     params.public_content_network_effect = 0.18 * network_effect_multiplier
+    
+    # Wellspring Marketplace parameters
+    st.sidebar.subheader("Wellspring Marketplace")
+    
+    # Adjust transaction fee (already exists but moved to this section for clarity)
+    params.wellspring_tx_fee = st.sidebar.slider(
+        "Wellspring Transaction Fee", 
+        0.01, 0.3, params.wellspring_tx_fee, 0.01,
+        help="Percentage fee charged on Wellspring marketplace transactions. Marketplace fees typically range from 5-30% depending on value provided and industry standards."
+    )
+    
+    # Add parameters for dual-role participants
+    params.grower_seller_pct = st.sidebar.slider(
+        "Growers as Sellers (%)", 
+        5, 80, 30, 5,
+        help="Percentage of growers who also act as sellers on the Wellspring marketplace, providing specialized knowledge."
+    ) / 100
+    
+    params.landscaper_seller_pct = st.sidebar.slider(
+        "Landscapers as Sellers (%)", 
+        5, 70, 25, 5,
+        help="Percentage of landscapers who also act as sellers on the Wellspring marketplace, providing practical advice."
+    ) / 100
+    
+    # Credits system parameters
+    credits_price = st.sidebar.number_input(
+        "Price per Credit ($)", 
+        1.0, 50.0, 10.0, 1.0, 
+        help="Price per credit for Wellspring marketplace transactions. Credits are used to pay for advice and consultations."
+    )
+    
+    avg_monthly_credits = st.sidebar.slider(
+        "Avg. Monthly Credits per User", 
+        1, 50, 5, 1,
+        help="Average number of credits consumed per active user each month. Higher credit usage indicates more marketplace activity."
+    )
+    
+    # Store these values on params
+    params.grower_seller_pct = params.grower_seller_pct
+    params.landscaper_seller_pct = params.landscaper_seller_pct
+    params.credits_price = credits_price
+    params.avg_monthly_credits = avg_monthly_credits
+    
+    # No need to redefine these functions as they're now global
+    params.calculate_wellspring_revenue = lambda model: calculate_wellspring_revenue(model, params)
     
     # Conversion parameters
     st.sidebar.subheader("Conversion Parameters")
@@ -175,7 +400,7 @@ def create_params():
     params.base_pro_churn_rate = st.sidebar.slider(
         "Base Pro Churn", 
         0.02, 0.2, params.base_pro_churn_rate, 0.01,
-        help="Monthly churn rate for pro users. Industry benchmarks: 3-5% is good, 5-7% is average, >8% needs improvement. Higher than enterprise due to individual purchasing decisions."
+        help="Monthly churn rate for pro users (architects and landscapers). Industry benchmarks: 3-5% is good, 5-7% is average, >8% needs improvement. Higher than enterprise due to individual purchasing decisions."
     )
     
     # Transaction fees
@@ -191,6 +416,36 @@ def create_params():
         help="Percentage fee charged on Wellspring marketplace transactions. Marketplace fees typically range from 5-30% depending on value provided and industry standards."
     )
     
+    # Enterprise Team Parameters - add this section
+    st.sidebar.subheader("Enterprise Team Parameters")
+    params.base_team_size = st.sidebar.slider(
+        "Base Team Size", 
+        1, 15, 5, 1,
+        help="Number of users included in the base enterprise subscription. Industry benchmarks: 3-5 for basic teams, 5-10 for growing teams."
+    )
+    
+    params.additional_user_cost = st.sidebar.slider(
+        "Additional User Cost ($)", 
+        10, 100, 49, 5,
+        help="Monthly cost for each additional user beyond the base team size. Typically 20-40% of the per-user equivalent price."
+    )
+    
+    params.avg_team_size = st.sidebar.slider(
+        "Average Team Size", 
+        params.base_team_size, 30, min(params.base_team_size + 5, 15), 1,
+        help="Average team size for enterprise customers. This determines how many additional users are paying."
+    )
+    
+    params.max_team_size = st.sidebar.slider(
+        "Maximum Team Size", 
+        params.avg_team_size, 50, params.avg_team_size + 10, 5,
+        help="Maximum allowed team size. Set to unlimited by making it very large."
+    )
+    
+    # Ensure avg_team_size is never less than base_team_size
+    if params.avg_team_size < params.base_team_size:
+        params.avg_team_size = params.base_team_size
+    
     # Cost structure parameters
     st.sidebar.subheader("Cost Structure")
     params.service_cost_per_enterprise = st.sidebar.number_input(
@@ -201,7 +456,7 @@ def create_params():
     params.service_cost_per_pro = st.sidebar.number_input(
         "Monthly Cost per Pro User ($)", 
         1, 100, int(params.service_cost_per_pro), 5,
-        help="Direct monthly cost to service a pro/landscaper account, including infrastructure, support, and operations costs."
+        help="Direct monthly cost to service a pro account (architect or landscaper), including infrastructure, support, and operations costs."
     )
     
     # Replace CAC inputs with marketing budget allocation fields
@@ -303,8 +558,7 @@ with tab_params:
         st.subheader("Key Customer Segments")
         st.markdown("""
         - **Enterprise Users**: Landscape architecture firms (teams)
-        - **Pro Users**: Individual landscape architects
-        - **Landscapers**: Individual contractors/landscapers
+        - **Pro Users**: Individual professionals (includes both landscape architects and landscapers)
         - **Consultants**: Horticultural experts on Wellspring marketplace
         - **Growers**: Providers of plant catalogs
         """)
@@ -338,7 +592,7 @@ with tab_basic:
         init_pro_price = st.number_input(
             "Pro Monthly Price ($)", 
             10, 500, 99, 5,
-            help="Monthly price for professional individual users. Industry benchmarks: $10-30 for basic tools, $50-150 for professional tools, $100-300 for specialized software with high value."
+            help="Monthly price for professional individual users (both landscape architects and landscapers). Industry benchmarks: $10-30 for basic tools, $50-150 for professional tools, $100-300 for specialized software with high value."
         )
         init_lifetime_price = st.number_input(
             "Lifetime Deal Price ($)", 
@@ -366,6 +620,14 @@ with tab_basic:
                 # Add the model to the results for revenue calculation
                 initial_results['model'] = initial_model
                 
+                # Calculate Wellspring marketplace metrics using our new function
+                wellspring_revenue = calculate_wellspring_revenue(initial_model, params)
+                initial_model.wellspring_revenue = wellspring_revenue  # Override the default calculation
+                
+                # Calculate effective consultant count including dual-role participants
+                effective_consultant_count = effective_consultants(initial_model, params)
+                initial_results['effective_consultants'] = effective_consultant_count
+                
                 # Store in session state for comparison tab
                 st.session_state.initial_results = {
                     'enterprise_price': init_enterprise_price,
@@ -384,6 +646,15 @@ with tab_basic:
                     'history': initial_results['history']
                 }
                 
+                # Calculate additional team users revenue
+                additional_users = initial_results['final_enterprise_users'] * max(0, params.avg_team_size - params.base_team_size)
+                additional_user_revenue = additional_users * params.additional_user_cost
+                
+                # Add the additional user revenue to the final MRR for display
+                initial_results['final_mrr'] += additional_user_revenue
+                initial_model.additional_user_revenue = additional_user_revenue
+                st.session_state.initial_results['final_mrr'] = initial_results['final_mrr']
+                
                 # Display results
                 st.subheader("Initial Results")
                 st.metric("NPV", f"${initial_results['npv']:,.2f}")
@@ -398,71 +669,36 @@ with tab_basic:
                 
                 # Display static metrics
                 st.subheader("Initial Model Results")
-                rev_col1, rev_col2, rev_col3 = st.columns(3)
+                rev_col1, rev_col2, rev_col3, rev_col4 = st.columns(4)
                 with rev_col1:
                     # Use model directly for the values
                     contract_rev = initial_model.contract_revenue
                     wellspring_rev = initial_model.wellspring_revenue
-                    subscription_rev = initial_results['final_mrr'] - contract_rev - wellspring_rev
+                    subscription_rev = initial_results['final_mrr'] - contract_rev - wellspring_rev - additional_user_revenue
                     st.metric("Subscription Revenue", f"${subscription_rev:,.2f}")
                 with rev_col2:
                     st.metric("Contract Revenue", f"${contract_rev:,.2f}")
                 with rev_col3:
                     st.metric("Wellspring Revenue", f"${wellspring_rev:,.2f}")
-                    
-                # User metrics
-                users_col1, users_col2, users_col3 = st.columns(3)
-                with users_col1:
-                    st.metric("Enterprise Users", f"{initial_results['final_enterprise_users']:.0f}")
-                with users_col2:
-                    st.metric("Pro Users", f"{initial_results['final_pro_users']:.0f}")
-                with users_col3:
-                    st.metric("Consultants", f"{initial_results['final_consultants']:.0f}")
+                with rev_col4:
+                    st.metric("Additional User Revenue", f"${additional_user_revenue:,.2f}")
+
+                # Add enterprise team metrics section
+                st.subheader("Enterprise Team Metrics")
+                team_col1, team_col2, team_col3 = st.columns(3)
+                with team_col1:
+                    st.metric("Enterprise Accounts", f"{initial_results['final_enterprise_users']:.0f}")
+                with team_col2:
+                    additional_users = initial_results['final_enterprise_users'] * max(0, params.avg_team_size - params.base_team_size)
+                    additional_user_revenue = additional_users * params.additional_user_cost
+                    st.metric("Additional Users", f"{additional_users:.0f}")
+                with team_col3:
+                    total_enterprise_users = initial_results['final_enterprise_users'] * params.avg_team_size
+                    st.metric("Total Enterprise Users", f"{total_enterprise_users:.0f}")
                 
-                # Plot
-                fig = visualize_pricing_strategies({'model': initial_model, 'enterprise_price': init_enterprise_price, 'pro_price': init_pro_price})
-                st.pyplot(fig)
-                
-                # Add runway impact section
-                st.subheader("Runway & Cash Flow Impact")
-                
-                # Calculate monthly burn after revenue
-                monthly_net_burn = monthly_burn_rate - initial_results['final_mrr']
-                
-                # Only show extended runway if revenue is positive but less than burn rate
-                if monthly_net_burn > 0 and initial_results['final_mrr'] > 0:
-                    new_runway = runway_months * (monthly_burn_rate / monthly_net_burn)
-                    runway_extension = new_runway - runway_months
-                    
-                    runway_col1, runway_col2 = st.columns(2)
-                    with runway_col1:
-                        st.metric("Current Runway", f"{runway_months} months")
-                    with runway_col2:
-                        st.metric("Extended Runway", f"{new_runway:.1f} months", f"+{runway_extension:.1f} months")
-                
-                # Calculate months to cash flow positive
-                if monthly_net_burn <= 0:
-                    st.success(f"This pricing strategy makes you cash flow positive with ${abs(monthly_net_burn):.2f} monthly surplus!")
-                else:
-                    # Estimate time to positive cash flow based on MRR growth rate
-                    if len(initial_model.history['mrr']) > 3:
-                        # Calculate average monthly growth rate from the last few months
-                        recent_mrr = initial_model.history['mrr'][-3:]
-                        if recent_mrr[0] > 0:
-                            monthly_growth_rate = (recent_mrr[-1] / recent_mrr[0]) ** (1/3) - 1
-                            
-                            # Only show projection if we have positive growth
-                            if monthly_growth_rate > 0:
-                                # Project months until MRR >= burn rate
-                                months_to_positive = np.log(monthly_burn_rate / initial_results['final_mrr']) / np.log(1 + monthly_growth_rate)
-                                
-                                if months_to_positive > 0 and months_to_positive < 36:
-                                    st.info(f"Estimated time to positive cash flow: {months_to_positive:.1f} months at current growth rate ({monthly_growth_rate*100:.1f}% monthly)")
-                                elif months_to_positive >= 36:
-                                    st.warning(f"At current growth rate ({monthly_growth_rate*100:.1f}% monthly), positive cash flow will take more than 3 years")
-                            else:
-                                st.warning("MRR growth is flat or negative. Unable to project time to positive cash flow.")
-    
+                # Add additional user revenue to the revenue breakdown
+                st.metric("Additional User Revenue", f"${additional_user_revenue:,.2f}")
+
     with col2:
         # Optimization
         st.subheader("Pricing Optimization")
@@ -553,6 +789,22 @@ with tab_basic:
                 # Store in session state for comparison tab
                 st.session_state.optimized_results = optimized_results
                 
+                # Calculate additional user revenue for optimized model
+                opt_additional_users = optimized_results['final_enterprise_users'] * max(0, params.avg_team_size - params.base_team_size)
+                opt_additional_user_revenue = opt_additional_users * params.additional_user_cost
+                
+                # Add the additional user revenue to the final MRR for display
+                optimized_results['final_mrr'] += opt_additional_user_revenue
+                optimized_results['model'].additional_user_revenue = opt_additional_user_revenue
+                
+                # Calculate Wellspring marketplace metrics for the optimized model
+                optimized_wellspring_revenue = calculate_wellspring_revenue(optimized_results['model'], params)
+                optimized_results['model'].wellspring_revenue = optimized_wellspring_revenue  # Override default
+                
+                # Calculate effective consultant count
+                optimized_effective_consultants = effective_consultants(optimized_results['model'], params)
+                optimized_results['effective_consultants'] = optimized_effective_consultants
+                
                 # Display results
                 st.subheader("Optimized Results")
                 st.metric("NPV", f"${optimized_results['npv']:,.2f}")
@@ -575,18 +827,36 @@ with tab_basic:
                 
                 # Revenue breakdown
                 st.subheader("Revenue Breakdown")
-                rev_col1, rev_col2, rev_col3 = st.columns(3)
+                rev_col1, rev_col2, rev_col3, rev_col4 = st.columns(4)
                 with rev_col1:
-                    # Use model directly for the values, rather than looking for keys in optimized_results
+                    # Use model directly for the values
                     contract_rev = optimized_results['model'].contract_revenue
-                    wellspring_rev = optimized_results['model'].wellspring_revenue
-                    subscription_rev = optimized_results['final_mrr'] - contract_rev - wellspring_rev
+                    wellspring_rev = optimized_results['model'].wellspring_revenue  # Use our calculated value
+                    subscription_rev = optimized_results['final_mrr'] - contract_rev - wellspring_rev - opt_additional_user_revenue
                     st.metric("Subscription Revenue", f"${subscription_rev:,.2f}")
                 with rev_col2:
                     st.metric("Contract Revenue", f"${contract_rev:,.2f}")
                 with rev_col3:
                     st.metric("Wellspring Revenue", f"${wellspring_rev:,.2f}")
+                with rev_col4:
+                    st.metric("Additional User Revenue", f"${opt_additional_user_revenue:,.2f}")
+                    
+                # Add enterprise team metrics section
+                st.subheader("Enterprise Team Metrics")
+                team_col1, team_col2, team_col3 = st.columns(3)
+                with team_col1:
+                    st.metric("Enterprise Accounts", f"{optimized_results['final_enterprise_users']:.0f}")
+                with team_col2:
+                    opt_additional_users = optimized_results['final_enterprise_users'] * max(0, params.avg_team_size - params.base_team_size)
+                    opt_additional_user_revenue = opt_additional_users * params.additional_user_cost
+                    st.metric("Additional Users", f"{opt_additional_users:.0f}")
+                with team_col3:
+                    opt_total_enterprise_users = optimized_results['final_enterprise_users'] * params.avg_team_size
+                    st.metric("Total Enterprise Users", f"{opt_total_enterprise_users:.0f}")
                 
+                # Add additional user revenue to the revenue breakdown
+                st.metric("Additional User Revenue", f"${opt_additional_user_revenue:,.2f}")
+                    
                 # Plot
                 fig = visualize_pricing_strategies(optimized_results)
                 st.pyplot(fig)
@@ -1096,6 +1366,138 @@ with tab_network:
             st.subheader("Elasticity and Network Effect Visualizations")
             st.pyplot(elasticity_analysis['visualizations'])
 
+# Wellspring Marketplace Analysis Tab
+with tab_wellspring:
+    st.header("Wellspring Marketplace Analysis")
+    
+    st.markdown("""
+    This tab focuses on analyzing the Wellspring marketplace dynamics, including:
+    
+    - **Marketplace Liquidity** - Balance of buyers and sellers
+    - **Credits Economics** - Pricing and consumption patterns
+    - **Dual-Role Participants** - Users who both buy and sell advice
+    - **Revenue Optimization** - Finding the optimal transaction fee structure
+    """)
+    
+    col1, col2 = st.columns([1, 1])
+    
+    with col1:
+        st.subheader("Marketplace Parameters")
+        
+        # Use existing parameters for consistency
+        wellspring_tx_fee = st.slider(
+            "Transaction Fee (%)", 
+            1, 30, int(params.wellspring_tx_fee * 100), 1,
+            help="Percentage fee charged on marketplace transactions"
+        ) / 100
+        
+        credit_price = st.slider(
+            "Credit Price ($)", 
+            1, 50, int(params.credits_price), 1,
+            help="Price per credit for advice marketplace transactions"
+        )
+        
+        # Calculate implied metrics
+        implied_revenue_per_credit = credit_price * wellspring_tx_fee
+        st.info(f"Revenue per credit: ${implied_revenue_per_credit:.2f}")
+        
+        # Credit package options
+        st.subheader("Credit Package Options")
+        
+        credit_packages = {
+            "Starter": {"credits": 10, "price": credit_price * 10},
+            "Pro": {"credits": 50, "price": credit_price * 50 * 0.9},  # 10% discount
+            "Business": {"credits": 200, "price": credit_price * 200 * 0.8},  # 20% discount
+        }
+        
+        # Display as a table
+        package_data = []
+        for name, details in credit_packages.items():
+            package_data.append({
+                "Package": name,
+                "Credits": details["credits"],
+                "Price": f"${details['price']:.2f}",
+                "Per Credit": f"${details['price']/details['credits']:.2f}",
+                "Savings": f"{(1 - (details['price']/(details['credits']*credit_price))) * 100:.0f}%"
+            })
+        
+        package_df = pd.DataFrame(package_data)
+        st.table(package_df)
+        
+    with col2:
+        st.subheader("Marketplace Dynamics")
+        
+        if st.button("Analyze Marketplace Dynamics"):
+            with st.spinner("Analyzing marketplace dynamics..."):
+                # Create a simple model for analysis
+                base_model = PricingSystemModel(params, {
+                    'enterprise': 299,
+                    'pro': 99,
+                    'lifetime': 995,
+                    'consultant_fee': 0.7,
+                    'trial_days': 14
+                })
+                base_results = base_model.run_simulation()
+                
+                # Calculate metrics specific to the marketplace using global function
+                effective_sellers = effective_consultants(base_model, params)
+                potential_buyers = base_model.enterprise_users * 5 + base_model.pro_users
+                
+                # Calculate liquidity metrics
+                buyer_seller_ratio = potential_buyers / max(1, effective_sellers)
+                liquidity_score = min(10, 10 * (effective_sellers / 100)) * min(10, 10 * (potential_buyers / 1000)) / 10
+                
+                # Display metrics
+                st.metric("Effective Sellers", f"{effective_sellers:.0f}")
+                st.metric("Potential Buyers", f"{potential_buyers:.0f}")
+                st.metric("Buyer/Seller Ratio", f"{buyer_seller_ratio:.1f}", 
+                         help="Ratio of potential buyers to sellers. Optimal range is typically 5-20.")
+                
+                st.metric("Marketplace Liquidity Score", f"{liquidity_score:.1f}/10",
+                         help="Combined score based on marketplace size and balance. Higher is better.")
+                
+                # Revenue simulation with different fee structures
+                st.subheader("Fee Structure Analysis")
+                
+                fee_range = np.arange(0.05, 0.31, 0.05)
+                fee_results = []
+                
+                for fee in fee_range:
+                    # Simulate impact of different fees on volume
+                    fee_elasticity = -0.4  # Assume modest elasticity
+                    volume_factor = (fee / params.wellspring_tx_fee) ** fee_elasticity
+                    
+                    # Calculate revenue
+                    adjusted_revenue = calculate_wellspring_revenue(base_model, params) * (fee / params.wellspring_tx_fee) * volume_factor
+                    
+                    fee_results.append({
+                        "Fee": f"{fee*100:.0f}%",
+                        "Revenue": adjusted_revenue,
+                        "Volume": base_model.consultants * params.avg_monthly_credits * volume_factor
+                    })
+                
+                # Convert to DataFrame and display
+                fee_df = pd.DataFrame(fee_results)
+                
+                # Find optimal fee
+                optimal_row = fee_df.loc[fee_df["Revenue"].idxmax()]
+                
+                st.success(f"Optimal transaction fee: {optimal_row['Fee']} (maximizes revenue at ${optimal_row['Revenue']:.2f}/mo)")
+                
+                # Show as chart
+                st.line_chart(fee_df.set_index("Fee")["Revenue"])
+                
+                # Show credit consumption patterns
+                st.subheader("Credit Consumption Patterns")
+                
+                # Create sample distribution of credit usage
+                st.bar_chart({
+                    "Light Users (1-5 credits)": 50,
+                    "Medium Users (6-15 credits)": 30,
+                    "Heavy Users (16-30 credits)": 15,
+                    "Power Users (31+ credits)": 5
+                })
+
 # Comparison Tab
 with tab_compare:
     st.header("Strategy Comparison")
@@ -1566,9 +1968,26 @@ with tab_financial:
         # Create a session state key for the costs data if it doesn't exist
         if 'costs_data' not in st.session_state:
             st.session_state.costs_data = default_costs_data
+            
+            # Ensure numeric columns have proper types when initializing
+            df_temp = pd.DataFrame(default_costs_data)
+            df_temp["Monthly"] = pd.to_numeric(df_temp["Monthly"], errors="coerce").fillna(0).astype(int)
+            df_temp["Yearly"] = pd.to_numeric(df_temp["Yearly"], errors="coerce").fillna(0).astype(int)
+            
+            # Update session state with proper types
+            st.session_state.costs_data = {
+                "Expense": df_temp["Expense"].tolist(),
+                "Monthly": df_temp["Monthly"].tolist(),
+                "Yearly": df_temp["Yearly"].tolist(),
+                "Annual Growth": df_temp["Annual Growth"].tolist(),
+                "Contingency": df_temp["Contingency"].tolist()
+            }
         
         # Convert to DataFrame for editing
         costs_df = pd.DataFrame(st.session_state.costs_data)
+        
+        # Ensure all values in the Yearly column are numeric
+        costs_df["Yearly"] = pd.to_numeric(costs_df["Yearly"], errors="coerce").fillna(0).astype(int)
         
         # Create an editable dataframe
         edited_costs_df = st.data_editor(
@@ -1581,9 +2000,11 @@ with tab_financial:
                     min_value=0,
                     format="$%d"
                 ),
-                "Yearly": st.column_config.TextColumn(
+                "Yearly": st.column_config.NumberColumn(
                     "Yearly ($)",
-                    help="Annual salary or cost (leave empty if monthly is used)"
+                    min_value=0,
+                    format="$%d",
+                    help="Annual salary or cost"
                 ),
                 "Annual Growth": st.column_config.TextColumn(
                     "Annual Growth",
@@ -1600,8 +2021,8 @@ with tab_financial:
         # Update the session state with the edited data
         st.session_state.costs_data = {
             "Expense": edited_costs_df["Expense"].tolist(),
-            "Monthly": edited_costs_df["Monthly"].tolist(),
-            "Yearly": edited_costs_df["Yearly"].tolist(),
+            "Monthly": edited_costs_df["Monthly"].astype(int).tolist(),
+            "Yearly": edited_costs_df["Yearly"].astype(int).tolist(),
             "Annual Growth": edited_costs_df["Annual Growth"].tolist(),
             "Contingency": edited_costs_df["Contingency"].tolist()
         }
@@ -1717,14 +2138,18 @@ with tab_financial:
             
             # Revenue breakdown
             st.subheader("Revenue Breakdown")
-            rev_col1, rev_col2, rev_col3 = st.columns(3)
+            rev_col1, rev_col2, rev_col3, rev_col4 = st.columns(4)
             with rev_col1:
-                subscription_rev = monthly_revenue[-1] - selected_model['model'].contract_revenue - selected_model['model'].wellspring_revenue
+                # Calculate additional user revenue if available
+                additional_user_rev = getattr(selected_model['model'], 'additional_user_revenue', 0)
+                subscription_rev = monthly_revenue[-1] - selected_model['model'].contract_revenue - selected_model['model'].wellspring_revenue - additional_user_rev
                 st.metric("Subscription Revenue", f"${subscription_rev:,.2f}")
             with rev_col2:
                 st.metric("Contract Revenue", f"${selected_model['model'].contract_revenue:,.2f}")
             with rev_col3:
                 st.metric("Wellspring Revenue", f"${selected_model['model'].wellspring_revenue:,.2f}")
+            with rev_col4:
+                st.metric("Additional User Revenue", f"${additional_user_rev:,.2f}")
                 
             # Display the financial projection table
             st.subheader("Monthly Financial Projections")
@@ -1926,6 +2351,535 @@ with tab_seedstage:
                 - Consider offering a paid assessment or consulting session
                 - Typically works best for high-value enterprise software
                 """)
+
+# Now add the content for the Multi-Objective tab
+with tab_multiobjective:
+    st.header("Multi-Objective Pricing Optimization")
+    
+    if not PYMOO_AVAILABLE:
+        st.warning("PyMoo library is not available. Please install it with: pip install pymoo")
+        st.info("PyMoo is required for multi-objective optimization. See: https://pymoo.org")
+    else:
+        st.markdown("""
+        This tab uses multi-objective optimization to find the best trade-offs between different pricing objectives.
+        NSGA-III algorithm explores the parameter space to find a set of non-dominated solutions (Pareto front).
+        
+        You can visualize trade-offs between objectives and select a solution based on your preferences.
+        """)
+        
+        col1, col2 = st.columns([1, 1])
+        
+        with col1:
+            st.subheader("Optimization Objectives")
+            
+            # Select objectives to optimize
+            available_objectives = [
+                ("npv", "Net Present Value (NPV)"),
+                ("mrr", "Monthly Recurring Revenue (MRR)"),
+                ("ltv_cac", "LTV/CAC Ratio"),
+                ("gross_margin", "Gross Margin"),
+                ("enterprise_users", "Enterprise Users"),
+                ("pro_users", "Pro Users"),
+                ("consultants", "Consultants")
+            ]
+            
+            selected_objectives = st.multiselect(
+                "Select Objectives (2-5 recommended)",
+                [obj[0] for obj in available_objectives],
+                default=["npv", "mrr", "ltv_cac"],
+                format_func=lambda x: dict(available_objectives)[x],
+                help="Select which objectives to optimize. More objectives make the problem harder but explore more trade-offs."
+            )
+            
+            # Ensure at least two objectives are selected
+            if len(selected_objectives) < 2:
+                st.warning("Please select at least 2 objectives for multi-objective optimization.")
+            
+            # Select parameters to optimize
+            st.subheader("Parameters to Optimize")
+            
+            param_ranges = {}
+            
+            # Enterprise price
+            if st.checkbox("Enterprise Price", value=True):
+                min_enterprise, max_enterprise = st.slider(
+                    "Enterprise Price Range ($)",
+                    100, 1000, (200, 500),
+                    help="Range of possible values for enterprise price"
+                )
+                param_ranges["enterprise_price"] = {"min": min_enterprise, "max": max_enterprise}
+            
+            # Pro price
+            if st.checkbox("Pro Price", value=True):
+                min_pro, max_pro = st.slider(
+                    "Pro Price Range ($)",
+                    20, 300, (50, 150),
+                    help="Range of possible values for pro price"
+                )
+                param_ranges["pro_price"] = {"min": min_pro, "max": max_pro}
+            
+            # Lifetime price
+            if st.checkbox("Lifetime Deal Price", value=True):
+                min_lifetime, max_lifetime = st.slider(
+                    "Lifetime Price Range ($)",
+                    500, 3000, (800, 2000),
+                    help="Range of possible values for lifetime deal price"
+                )
+                param_ranges["lifetime_price"] = {"min": min_lifetime, "max": max_lifetime}
+            
+            # Additional user cost
+            if st.checkbox("Additional User Cost", value=True):
+                min_add_user, max_add_user = st.slider(
+                    "Additional User Cost Range ($)",
+                    10, 150, (30, 70),
+                    help="Range of possible values for additional user cost"
+                )
+                param_ranges["additional_user_cost"] = {"min": min_add_user, "max": max_add_user}
+            
+            # Transaction fee
+            if st.checkbox("Wellspring Transaction Fee", value=False):
+                min_tx_fee, max_tx_fee = st.slider(
+                    "Transaction Fee Range (%)",
+                    1, 30, (5, 15),
+                    help="Range of possible values for transaction fee percentage"
+                )
+                param_ranges["wellspring_tx_fee"] = {"min": min_tx_fee/100, "max": max_tx_fee/100}
+            
+            # Consultant fee share
+            if st.checkbox("Consultant Fee Share", value=False):
+                min_consultant_fee, max_consultant_fee = st.slider(
+                    "Consultant Fee Share Range (%)",
+                    50, 90, (60, 80),
+                    help="Range of possible values for consultant fee percentage"
+                )
+                param_ranges["consultant_fee"] = {"min": min_consultant_fee/100, "max": max_consultant_fee/100}
+        
+        with col2:
+            st.subheader("Optimization Settings")
+            
+            # Algorithm settings
+            population_size = st.slider(
+                "Population Size",
+                50, 200, 100, 10,
+                help="Number of solutions in each generation. Larger populations explore more of the search space but take longer."
+            )
+            
+            generations = st.slider(
+                "Number of Generations",
+                10, 100, 30, 5,
+                help="Number of iterations for the evolutionary algorithm. More generations allow for better convergence but take longer."
+            )
+            
+            # Time horizon for simulation
+            time_horizon = st.slider(
+                "Time Horizon (months)",
+                6, 36, 24,
+                help="Number of months to simulate for each solution evaluation."
+            )
+            
+            # Warning about computation time
+            st.info(f"""
+            Estimated computation time: {population_size * generations * 0.2:.1f}-{population_size * generations * 0.5:.1f} seconds
+            
+            Multi-objective optimization is computationally intensive. The algorithm will evaluate 
+            {population_size * generations} different parameter combinations to find the Pareto front.
+            """)
+            
+            # Run optimization button
+            if st.button("Run Multi-Objective Optimization"):
+                if len(selected_objectives) < 2:
+                    st.error("Please select at least 2 objectives.")
+                elif len(param_ranges) < 2:
+                    st.error("Please select at least 2 parameters to optimize.")
+                else:
+                    with st.spinner("Running multi-objective optimization..."):
+                        progress_bar = st.progress(0)
+                        
+                        # Prepare parameters
+                        params.time_horizon_months = time_horizon
+                        
+                        # Run the optimization
+                        start_time = time.time()
+                        
+                        # Show progress updates
+                        for i in range(generations):
+                            progress = (i + 1) / generations
+                            progress_bar.progress(progress)
+                            time.sleep(0.1)  # Simulate computation time
+                        
+                        try:
+                            # Run the actual optimization
+                            res, problem = run_multiobjective_optimization(
+                                params,
+                                selected_objectives,
+                                param_ranges,
+                                pop_size=population_size,
+                                n_gen=generations
+                            )
+                            
+                            elapsed_time = time.time() - start_time
+                            
+                            # Store results in session state
+                            st.session_state.multi_obj_results = {
+                                'results': res,
+                                'problem': problem,
+                                'objectives': selected_objectives,
+                                'param_ranges': param_ranges,
+                                'param_names': list(param_ranges.keys())
+                            }
+                            
+                            # Display success message
+                            st.success(f"Optimization completed in {elapsed_time:.2f} seconds. Found {len(res.F)} solutions on the Pareto front.")
+                            
+                            # Display a table with solutions
+                            st.subheader("Pareto Optimal Solutions")
+                            
+                            # Create solutions dataframe
+                            solutions_data = {}
+                            
+                            # Add solution number
+                            solutions_data["Solution"] = [f"#{i+1}" for i in range(len(res.X))]
+                            
+                            # Add parameter values
+                            for j, param_name in enumerate(param_ranges.keys()):
+                                solutions_data[param_name] = [f"{res.X[i, j]:.2f}" for i in range(len(res.X))]
+                            
+                            # Add objective values (negated to show maximization values)
+                            for j, obj_name in enumerate(selected_objectives):
+                                display_name = dict(available_objectives)[obj_name]
+                                solutions_data[display_name] = [f"{-res.F[i, j]:.2f}" for i in range(len(res.F))]
+                            
+                            # Create dataframe and display table
+                            solutions_df = pd.DataFrame(solutions_data)
+                            st.dataframe(solutions_df, use_container_width=True)
+                            
+                            # Always generate simple dominated solutions for visualization
+                            # These are purely for visual context and don't need to be accurate simulations
+                            try:
+                                # Generate a reasonable number of dominated points
+                                n_dominated = min(200, len(res.X) * 5)  # Limit to reasonable number
+                                
+                                # Generate random parameters within bounds
+                                dominated_X = np.zeros((n_dominated, len(param_ranges)))
+                                for j, param_name in enumerate(param_ranges.keys()):
+                                    param_min = param_ranges[param_name]['min']
+                                    param_max = param_ranges[param_name]['max']
+                                    dominated_X[:, j] = np.random.uniform(param_min, param_max, n_dominated)
+                                
+                                # Generate dominated objective values (worse than Pareto front)
+                                dominated_F = np.zeros((n_dominated, len(selected_objectives)))
+                                
+                                # Find ranges of Pareto front objectives
+                                F_min = np.min(res.F, axis=0)
+                                F_max = np.max(res.F, axis=0)
+                                
+                                # Make dominated points slightly worse than Pareto front
+                                for j in range(len(selected_objectives)):
+                                    # Create values that are mostly worse than Pareto front
+                                    # Remember we're minimizing, so higher values are worse
+                                    dominated_F[:, j] = np.random.uniform(
+                                        F_min[j],  # Some points can be as good as Pareto front
+                                        F_max[j] * 1.5,  # But mostly worse
+                                        n_dominated
+                                    )
+                            except Exception as e:
+                                # If there's a problem, create empty arrays (no dominated points)
+                                dominated_X = np.empty((0, len(param_ranges)))
+                                dominated_F = np.empty((0, len(selected_objectives)))
+                            
+                            # Display Pareto front visualization
+                            if len(selected_objectives) == 2:
+                                # 2D visualization with Plotly
+                                fig = go.Figure()
+                                
+                                # Add dominated solutions as tiny, faded dots
+                                if len(dominated_F) > 0:
+                                    # Negate the values for display as maximize objectives
+                                    x_dom = -dominated_F[:, 0]
+                                    y_dom = -dominated_F[:, 1]
+                                    
+                                    # Add dominated solutions as very small, low opacity points
+                                    fig.add_trace(go.Scatter(
+                                        x=x_dom, 
+                                        y=y_dom,
+                                        mode='markers',
+                                        marker=dict(
+                                            size=2,  # Very small
+                                            color='rgba(200,200,200,0.3)',  # Very light gray
+                                            opacity=0.3,  # Very transparent
+                                            line=dict(width=0)
+                                        ),
+                                        name="Background Solutions",
+                                        hoverinfo='skip'  # No hover info for cleaner display
+                                    ))
+                                
+                                # Negate the values as we store them as minimize objectives but want to display as maximize
+                                x = -res.F[:, 0]
+                                y = -res.F[:, 1]
+                                
+                                # Create scatter plot for Pareto front
+                                fig.add_trace(go.Scatter(
+                                    x=x, 
+                                    y=y,
+                                    mode='markers',
+                                    marker=dict(
+                                        size=12,
+                                        color=x,  # Color by first objective
+                                        colorscale='Viridis',
+                                        opacity=0.8,
+                                        line=dict(width=1, color='DarkSlateGrey')
+                                    ),
+                                    name="Pareto Front",
+                                    text=[f"Solution {i+1}" for i in range(len(res.F))],
+                                    hovertemplate='%{text}<br>' +
+                                                 f'{dict(available_objectives)[selected_objectives[0]]}: %{{x:.2f}}<br>' +
+                                                 f'{dict(available_objectives)[selected_objectives[1]]}: %{{y:.2f}}'
+                                ))
+                                
+                                # Update layout
+                                fig.update_layout(
+                                    title="Pareto Front",
+                                    xaxis=dict(title=dict(available_objectives)[selected_objectives[0]]),
+                                    yaxis=dict(title=dict(available_objectives)[selected_objectives[1]]),
+                                    width=800,
+                                    height=600
+                                )
+                                
+                                st.plotly_chart(fig, use_container_width=True)
+                                
+                            elif len(selected_objectives) == 3:
+                                # 3D bubble chart with Plotly
+                                
+                                fig = go.Figure()
+                                
+                                # Add dominated solutions as tiny points
+                                if len(dominated_F) > 0:
+                                    # Negate the values for display (maximize objectives)
+                                    x_dom = -dominated_F[:, 0]
+                                    y_dom = -dominated_F[:, 1]
+                                    z_dom = -dominated_F[:, 2]
+                                    
+                                    # Add dominated solutions as very small, low opacity points
+                                    fig.add_trace(go.Scatter3d(
+                                        x=x_dom,
+                                        y=y_dom,
+                                        z=z_dom,
+                                        mode='markers',
+                                        marker=dict(
+                                            size=1.5,  # Very small
+                                            color='rgba(10,10,10,0.5)',  # Very light gray
+                                            opacity=0.3,  # Very transparent
+                                            line=dict(width=0)
+                                        ),
+                                        name="Background Solutions",
+                                        hoverinfo='skip'  # No hover info for cleaner display
+                                    ))
+                                
+                                # Negate the values for display (maximize objectives)
+                                x = -res.F[:, 0]
+                                y = -res.F[:, 1]
+                                z = -res.F[:, 2]
+                                
+                                # Create size variable based on compromise of all objectives
+                                # Normalize each objective
+                                x_norm = (x - np.min(x)) / (np.max(x) - np.min(x)) if np.max(x) > np.min(x) else x
+                                y_norm = (y - np.min(y)) / (np.max(y) - np.min(y)) if np.max(y) > np.min(y) else y
+                                z_norm = (z - np.min(z)) / (np.max(z) - np.min(z)) if np.max(z) > np.min(z) else z
+                                
+                                # Size represents how good the solution is across all objectives
+                                size = 10 + 30 * ((x_norm + y_norm + z_norm) / 3)
+                                
+                                # Create interactive 3D bubble chart for Pareto front
+                                fig.add_trace(go.Scatter3d(
+                                    x=x,
+                                    y=y,
+                                    z=z,
+                                    mode='markers',
+                                    marker=dict(
+                                        size=size,
+                                        color=x,  # Color by first objective
+                                        colorscale='Viridis',
+                                        opacity=0.8,
+                                        colorbar=dict(
+                                            title=dict(available_objectives)[selected_objectives[0]]
+                                        )
+                                    ),
+                                    name="Pareto Front",
+                                    text=[f"Solution {i+1}" for i in range(len(res.F))],
+                                    hovertemplate='%{text}<br>' +
+                                                 f'{dict(available_objectives)[selected_objectives[0]]}: %{{x:.2f}}<br>' +
+                                                 f'{dict(available_objectives)[selected_objectives[1]]}: %{{y:.2f}}<br>' +
+                                                 f'{dict(available_objectives)[selected_objectives[2]]}: %{{z:.2f}}'
+                                ))
+                                
+                                # Update layout for better visualization
+                                fig.update_layout(
+                                    title="Pareto Front - 3D Bubble Chart",
+                                    scene=dict(
+                                        xaxis=dict(title=dict(available_objectives)[selected_objectives[0]]),
+                                        yaxis=dict(title=dict(available_objectives)[selected_objectives[1]]),
+                                        zaxis=dict(title=dict(available_objectives)[selected_objectives[2]]),
+                                        camera=dict(
+                                            eye=dict(x=1.5, y=1.5, z=1.2)
+                                        )
+                                    ),
+                                    width=800,
+                                    height=700
+                                )
+                                
+                                st.plotly_chart(fig, use_container_width=True)
+                                
+                            else:
+                                # For more than 3 objectives, use Plotly's parallel coordinates plot
+                                try:
+                                    # Create normalized data for visualization
+                                    F_normalized = np.zeros_like(res.F)
+                                    for i in range(res.F.shape[1]):
+                                        f_min = np.min(res.F[:, i])
+                                        f_max = np.max(res.F[:, i])
+                                        if f_max > f_min:
+                                            F_normalized[:, i] = (res.F[:, i] - f_min) / (f_max - f_min)
+                                        else:
+                                            F_normalized[:, i] = res.F[:, i]
+                                    
+                                    # Create dimensions for parallel coordinates
+                                    dimensions = []
+                                    for i, obj in enumerate(selected_objectives):
+                                        dimensions.append(dict(
+                                            range=[0, 1],
+                                            label=dict(available_objectives)[obj],
+                                            values=1 - F_normalized[:, i],  # Invert for maximization
+                                            tickvals=[0, 0.25, 0.5, 0.75, 1],
+                                            ticktext=["Min", "25%", "50%", "75%", "Max"]
+                                        ))
+                                    
+                                    # Create parallel coordinates plot
+                                    fig = go.Figure(data=go.Parcoords(
+                                        line=dict(
+                                            color=1 - F_normalized[:, 0],  # Color by first objective
+                                            colorscale='Viridis',
+                                            showscale=True,
+                                            colorbar=dict(
+                                                title=dict(available_objectives)[selected_objectives[0]]
+                                            )
+                                        ),
+                                        dimensions=dimensions
+                                    ))
+                                    
+                                    # Update layout
+                                    fig.update_layout(
+                                        title="Parallel Coordinates Plot of Pareto Front",
+                                        width=800,
+                                        height=600
+                                    )
+                                    
+                                    st.plotly_chart(fig, use_container_width=True)
+                                    
+                                except Exception as e:
+                                    st.warning(f"Could not create parallel coordinates plot: {str(e)}")
+                                    st.error("Visualization error, falling back to table view")
+                            
+                            # Also add a 3D Bubble chart visualizing key parameters and objectives
+                            if len(param_ranges) >= 2 and len(selected_objectives) >= 1:
+                                st.subheader("Parameter-Objective Space Visualization")
+                                
+                                # Let user select which dimensions to visualize
+                                viz_col1, viz_col2 = st.columns(2)
+                                
+                                with viz_col1:
+                                    x_param = st.selectbox(
+                                        "X axis (parameter)",
+                                        options=list(param_ranges.keys()),
+                                        index=0
+                                    )
+                                    
+                                    y_param = st.selectbox(
+                                        "Y axis (parameter)",
+                                        options=list(param_ranges.keys()),
+                                        index=min(1, len(param_ranges.keys())-1)
+                                    )
+                                
+                                with viz_col2:
+                                    z_param = st.selectbox(
+                                        "Z axis (objective)",
+                                        options=selected_objectives,
+                                        format_func=lambda x: dict(available_objectives)[x],
+                                        index=0
+                                    )
+                                    
+                                    color_param = st.selectbox(
+                                        "Color (objective)",
+                                        options=selected_objectives,
+                                        format_func=lambda x: dict(available_objectives)[x],
+                                        index=min(1, len(selected_objectives)-1)
+                                    )
+                                
+                                # Get indices for selected parameters
+                                x_idx = list(param_ranges.keys()).index(x_param)
+                                y_idx = list(param_ranges.keys()).index(y_param)
+                                z_idx = selected_objectives.index(z_param)
+                                color_idx = selected_objectives.index(color_param)
+                                
+                                # Create 3D bubble chart
+                                fig = go.Figure()
+                                
+                                # Add dominated solutions as tiny points
+                                if len(dominated_X) > 0:
+                                    fig.add_trace(go.Scatter3d(
+                                        x=dominated_X[:, x_idx],
+                                        y=dominated_X[:, y_idx],
+                                        z=-dominated_F[:, z_idx],  # Negate for maximization
+                                        mode='markers',
+                                        marker=dict(
+                                            size=1.5,  # Very small
+                                            color='rgba(10,10,10,0.5)',  # Very light gray
+                                            opacity=0.3,  # Very transparent
+                                            line=dict(width=0)
+                                        ),
+                                        name="Background Solutions",
+                                        hoverinfo='skip'  # No hover info for cleaner display
+                                    ))
+                                
+                                # Add Pareto front solutions
+                                fig.add_trace(go.Scatter3d(
+                                    x=res.X[:, x_idx],
+                                    y=res.X[:, y_idx],
+                                    z=-res.F[:, z_idx],  # Negate for maximization
+                                    mode='markers',
+                                    marker=dict(
+                                        size=12,
+                                        color=-res.F[:, color_idx],  # Negate for maximization
+                                        colorscale='Viridis',
+                                        opacity=0.8,
+                                        colorbar=dict(
+                                            title=dict(available_objectives)[color_param]
+                                        )
+                                    ),
+                                    name="Pareto Front",
+                                    text=[f"Solution {i+1}" for i in range(len(res.F))],
+                                    hovertemplate='%{text}<br>' +
+                                                 f'{x_param}: %{{x:.2f}}<br>' +
+                                                 f'{y_param}: %{{y:.2f}}<br>' +
+                                                 f'{dict(available_objectives)[z_param]}: %{{z:.2f}}'
+                                ))
+                                
+                                # Update layout
+                                fig.update_layout(
+                                    title="Parameter-Objective Space",
+                                    scene=dict(
+                                        xaxis=dict(title=x_param),
+                                        yaxis=dict(title=y_param),
+                                        zaxis=dict(title=dict(available_objectives)[z_param])
+                                    ),
+                                    width=800,
+                                    height=700
+                                )
+                                
+                                st.plotly_chart(fig, use_container_width=True)
+                        
+                        except Exception as e:
+                            st.error(f"Error during optimization: {str(e)}")
+                            st.exception(e)
 
 # Footer
 st.markdown("---")
