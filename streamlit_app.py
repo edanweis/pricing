@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import time
 import plotly.graph_objects as go
 import plotly.express as px
+import copy  # Add this for deepcopy operations
 from main import (
     PricingParams, 
     PricingSystemModel, 
@@ -171,17 +172,17 @@ def effective_consultants(model, params):
 def calculate_wellspring_revenue(model, params):
     """Calculate Wellspring marketplace revenue based on credits model"""
     # Base revenue from dedicated consultants
-    base_revenue = model.consultants * params.avg_monthly_credits * params.credits_price * params.wellspring_tx_fee
+    base_revenue = model.consultants * params.avg_monthly_credits * params.credits_price * (1 - params.consultant_fee_percentage)
     
     # Additional revenue from dual-role participants
-    grower_revenue = model.growers * params.grower_seller_pct * params.avg_monthly_credits * 0.7 * params.credits_price * params.wellspring_tx_fee
+    grower_revenue = model.growers * params.grower_seller_pct * params.avg_monthly_credits * 0.7 * params.credits_price * (1 - params.consultant_fee_percentage)
     
     # Calculate total enterprise users (including additional team members)
     total_enterprise_users = model.enterprise_users * params.avg_team_size
     enterprise_additional_users = model.enterprise_users * max(0, params.avg_team_size - params.base_team_size)
     
     # Landscaper revenue includes both individual pros and enterprise additional users
-    landscaper_revenue = (model.pro_users + enterprise_additional_users * 0.3) * params.landscaper_seller_pct * params.avg_monthly_credits * 0.5 * params.credits_price * params.wellspring_tx_fee
+    landscaper_revenue = (model.pro_users + enterprise_additional_users * 0.3) * params.landscaper_seller_pct * params.avg_monthly_credits * 0.5 * params.credits_price * (1 - params.consultant_fee_percentage)
     
     # Total marketplace revenue
     total_revenue = base_revenue + grower_revenue + landscaper_revenue
@@ -330,13 +331,6 @@ def create_params():
     # Wellspring Marketplace parameters
     st.sidebar.subheader("Wellspring Marketplace")
     
-    # Adjust transaction fee (already exists but moved to this section for clarity)
-    params.wellspring_tx_fee = st.sidebar.slider(
-        "Wellspring Transaction Fee", 
-        0.01, 0.3, params.wellspring_tx_fee, 0.01,
-        help="Percentage fee charged on Wellspring marketplace transactions. Marketplace fees typically range from 5-30% depending on value provided and industry standards."
-    )
-    
     # Add parameters for dual-role participants
     params.grower_seller_pct = st.sidebar.slider(
         "Growers as Sellers (%)", 
@@ -363,11 +357,48 @@ def create_params():
         help="Average number of credits consumed per active user each month. Higher credit usage indicates more marketplace activity."
     )
     
+    # Consultant fee percentage - this is now the direct platform revenue share
+    consultant_fee = st.sidebar.slider(
+        "Consultant Fee Share (%)", 
+        10, 95, 70, 5,
+        help="Percentage of transaction value that goes to the consultant. The platform keeps the remainder (100% - consultant fee %)."
+    ) / 100
+    
+    # Add more Wellspring marketplace parameters from PricingParams
+    schedules_per_year = st.sidebar.slider(
+        "Schedules per Seller (yearly)", 
+        1, 100, int(params.schedules_per_seller_per_year), 1,
+        help="Average number of planting schedules created by each seller annually."
+    )
+    
+    substitutions_per_schedule = st.sidebar.slider(
+        "Substitutions per Schedule", 
+        1, 20, int(params.avg_substitutions_per_schedule), 1,
+        help="Average number of plant substitutions made per schedule."
+    )
+    
+    fee_per_substitution = st.sidebar.number_input(
+        "Fee per Substitution ($)", 
+        0.1, 10.0, params.fee_per_substitution, 0.1,
+        help="Fee charged for each plant substitution processed through the platform."
+    )
+    
+    performance_factor = st.sidebar.slider(
+        "Performance-Related Factor (%)", 
+        1, 100, int(params.performance_factor * 100), 1,
+        help="Percentage of substitutions deemed performance-related, affecting revenue calculations."
+    ) / 100
+    
     # Store these values on params
     params.grower_seller_pct = params.grower_seller_pct
     params.landscaper_seller_pct = params.landscaper_seller_pct
     params.credits_price = credits_price
     params.avg_monthly_credits = avg_monthly_credits
+    params.consultant_fee_percentage = consultant_fee  # Updated to store directly
+    params.schedules_per_seller_per_year = schedules_per_year
+    params.avg_substitutions_per_schedule = substitutions_per_schedule
+    params.fee_per_substitution = fee_per_substitution
+    params.performance_factor = performance_factor
     
     # No need to redefine these functions as they're now global
     params.calculate_wellspring_revenue = lambda model: calculate_wellspring_revenue(model, params)
@@ -410,11 +441,7 @@ def create_params():
         0.01, 0.2, params.contract_tx_fee, 0.01,
         help="Percentage fee charged on contract transactions. Industry benchmarks: 1-3% for payment processing only, 5-15% for platforms providing significant value-add services."
     )
-    params.wellspring_tx_fee = st.sidebar.slider(
-        "Wellspring Transaction Fee", 
-        0.01, 0.2, params.wellspring_tx_fee, 0.01,
-        help="Percentage fee charged on Wellspring marketplace transactions. Marketplace fees typically range from 5-30% depending on value provided and industry standards."
-    )
+    # Removed Wellspring Transaction Fee slider since we don't use it anymore
     
     # Enterprise Team Parameters - add this section
     st.sidebar.subheader("Enterprise Team Parameters")
@@ -1459,19 +1486,32 @@ with tab_wellspring:
                 # Revenue simulation with different fee structures
                 st.subheader("Fee Structure Analysis")
                 
-                fee_range = np.arange(0.05, 0.31, 0.05)
+                fee_range = np.arange(0.1, 0.41, 0.05)  # Range of consultant fee shares (10%-40% platform fee)
                 fee_results = []
                 
                 for fee in fee_range:
-                    # Simulate impact of different fees on volume
-                    fee_elasticity = -0.4  # Assume modest elasticity
-                    volume_factor = (fee / params.wellspring_tx_fee) ** fee_elasticity
+                    # Simulate impact of different platform fees on volume
+                    # Note: fee here represents platform fee, not consultant fee
+                    platform_fee = fee  # This is what platform keeps
+                    consultant_fee = 1 - platform_fee  # This is what consultant gets
                     
-                    # Calculate revenue
-                    adjusted_revenue = calculate_wellspring_revenue(base_model, params) * (fee / params.wellspring_tx_fee) * volume_factor
+                    # Adjust for fee elasticity (higher platform fees may reduce volume)
+                    fee_elasticity = -0.4  # Assume modest elasticity
+                    
+                    # Calculate relative change compared to baseline
+                    base_platform_fee = 1 - params.consultant_fee_percentage
+                    volume_factor = (platform_fee / base_platform_fee) ** fee_elasticity
+                    
+                    # Create a temporary params copy with the test fee value
+                    temp_params = copy.deepcopy(params)
+                    temp_params.consultant_fee_percentage = consultant_fee
+                    
+                    # Calculate revenue with this fee structure
+                    adjusted_revenue = calculate_wellspring_revenue(base_model, temp_params) * volume_factor
                     
                     fee_results.append({
-                        "Fee": f"{fee*100:.0f}%",
+                        "Platform Fee": f"{platform_fee*100:.0f}%",
+                        "Consultant Fee": f"{consultant_fee*100:.0f}%",
                         "Revenue": adjusted_revenue,
                         "Volume": base_model.consultants * params.avg_monthly_credits * volume_factor
                     })
@@ -1482,10 +1522,10 @@ with tab_wellspring:
                 # Find optimal fee
                 optimal_row = fee_df.loc[fee_df["Revenue"].idxmax()]
                 
-                st.success(f"Optimal transaction fee: {optimal_row['Fee']} (maximizes revenue at ${optimal_row['Revenue']:.2f}/mo)")
+                st.success(f"Optimal platform fee: {optimal_row['Platform Fee']} (consultant gets {optimal_row['Consultant Fee']}) - maximizes revenue at ${optimal_row['Revenue']:.2f}/mo")
                 
                 # Show as chart
-                st.line_chart(fee_df.set_index("Fee")["Revenue"])
+                st.line_chart(fee_df.set_index("Platform Fee")["Revenue"])
                 
                 # Show credit consumption patterns
                 st.subheader("Credit Consumption Patterns")
@@ -2436,23 +2476,16 @@ with tab_multiobjective:
                 )
                 param_ranges["additional_user_cost"] = {"min": min_add_user, "max": max_add_user}
             
-            # Transaction fee
-            if st.checkbox("Wellspring Transaction Fee", value=False):
-                min_tx_fee, max_tx_fee = st.slider(
-                    "Transaction Fee Range (%)",
-                    1, 30, (5, 15),
-                    help="Range of possible values for transaction fee percentage"
+            # Platform Fee Share - consolidated fee parameter
+            if st.checkbox("Platform Fee Share", value=True):
+                min_platform_fee, max_platform_fee = st.slider(
+                    "Platform Fee Share Range (%)",
+                    5, 40, (20, 30),
+                    help="Platform's share of marketplace transactions (consultant gets the remaining percentage). This parameter consolidates all marketplace fee settings."
                 )
-                param_ranges["wellspring_tx_fee"] = {"min": min_tx_fee/100, "max": max_tx_fee/100}
+                # Store as consultant fee (what consultant gets)
+                param_ranges["consultant_fee_percentage"] = {"min": (100-max_platform_fee)/100, "max": (100-min_platform_fee)/100}
             
-            # Consultant fee share
-            if st.checkbox("Consultant Fee Share", value=False):
-                min_consultant_fee, max_consultant_fee = st.slider(
-                    "Consultant Fee Share Range (%)",
-                    50, 90, (60, 80),
-                    help="Range of possible values for consultant fee percentage"
-                )
-                param_ranges["consultant_fee"] = {"min": min_consultant_fee/100, "max": max_consultant_fee/100}
         
         with col2:
             st.subheader("Optimization Settings")

@@ -1406,8 +1406,8 @@ class PricingSystemModel:
             self.params.avg_substitutions_per_schedule * 
             self.params.fee_per_substitution * 
             (1 - self.consultant_fee_percentage) *  # Platform's share
-            self.params.performance_factor *  # Adjustment for performance-related substitutions
-            self.params.wellspring_tx_fee  # Transaction fee percentage
+            self.params.performance_factor  # Adjustment for performance-related substitutions
+            # Removed wellspring_tx_fee as platform's share is now just (1 - consultant_fee_percentage)
         )
         
         return wellspring_revenue
