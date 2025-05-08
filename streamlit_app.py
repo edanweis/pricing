@@ -104,14 +104,14 @@ def create_params():
     
     params.potential_consultants = st.sidebar.slider(
         "Consultants", 
-        10, int(orig_consultants * 2), int(orig_consultants), 
+        10, 6000, int(orig_consultants), 
         step=10,
         help="Number of potential consultants available for your marketplace."
     )
     
     params.potential_growers = st.sidebar.slider(
         "Growers", 
-        10, int(orig_growers * 2), int(orig_growers), 
+        10, 3000, int(orig_growers), 
         step=10,
         help="Number of potential growers who could provide plant catalogs on your platform."
     )
@@ -1555,12 +1555,12 @@ with tab_financial:
         
         # Define default cost structure data
         default_costs_data = {
-            "Expense": ["Rent", "Software", "Office", "Director Salaries (2x)", "Debt equity", 
-                       "Engineer", "CMO", "Sales", "Freelance", "Legal", "Customer support"],
-            "Monthly": [5000, 4000, 600, 25000, 75000, 16667, 8333, 8333, 8000, 0, 7500],
-            "Yearly": ["", "", "", 300000, "", 200000, 100000, 100000, "", "", 90000],
-            "Annual Growth": ["5.00%", "20.00%", "5.00%", "2.00%", "0.00%", "5.00%", "5.00%", "5.00%", "0.00%", "0.00%", "2.00%"],
-            "Contingency": ["25%", "200%", "5%", "25%", "0%", "20%", "20%", "20%", "25%", "25%", "20%"]
+            "Expense": ["Director Salaries", "Rent", "Software", "Debt equity", "Engineer", 
+                       "CMO", "Sales", "Freelance", "Legal", "Customer support","Accounting","travel"],
+            "Monthly":[25000, 417, 667, 6250, 16667, 6667, 8333, 5000, 833, 2500, 417, 167],
+            "Yearly": [300000, 5000, 8000, 75000, 200000, 80000, 100000, 60000, 10000, 30000, 5000, 2000],
+            "Annual Growth":["5.00%", "3.00%", "10.00%", "0.00%", "8.00%", "12.00%", "15.00%", "10.00%", "5.00%", "10.00%", "3.00%", "20.00%"],
+            "Contingency": ["10%", "5%", "10%", "0%", "10%", "15%", "15%", "10%", "10%", "10%", "5%", "15%"]
         }
         
         # Create a session state key for the costs data if it doesn't exist
