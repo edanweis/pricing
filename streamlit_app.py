@@ -443,6 +443,13 @@ def create_params():
     )
     # Removed Wellspring Transaction Fee slider since we don't use it anymore
     
+    # Add average contract size
+    params.avg_contract_size = st.sidebar.number_input(
+        "Average Contract Size ($)",
+        1000, 100000, int(params.avg_contract_size), 1000,
+        help="Average value of commercial landscape contracts processed through the platform."
+    )
+    
     # Enterprise Team Parameters - add this section
     st.sidebar.subheader("Enterprise Team Parameters")
     params.base_team_size = st.sidebar.slider(
@@ -469,9 +476,100 @@ def create_params():
         help="Maximum allowed team size. Set to unlimited by making it very large."
     )
     
+    # Add billing multipliers
+    st.sidebar.subheader("Billing Cycles")
+    params.enterprise_billing_multiplier = st.sidebar.slider(
+        "Enterprise Billing Multiplier",
+        1, 12, params.enterprise_billing_multiplier, 1,
+        help="Multiplier for enterprise billing cycle. 1=monthly, 12=annual billing."
+    )
+    
+    params.pro_billing_multiplier = st.sidebar.slider(
+        "Pro Billing Multiplier",
+        1, 12, params.pro_billing_multiplier, 1,
+        help="Multiplier for pro billing cycle. 1=monthly, 12=annual billing."
+    )
+    
     # Ensure avg_team_size is never less than base_team_size
     if params.avg_team_size < params.base_team_size:
         params.avg_team_size = params.base_team_size
+    
+    # Segment distribution parameters
+    st.sidebar.subheader("Customer Segment Distribution")
+    params.landscape_architects_pct = st.sidebar.slider(
+        "Landscape Architects in Enterprise (%)",
+        10, 90, int(params.landscape_architects_pct * 100), 5,
+        help="Percentage of enterprise customers who are landscape architecture firms."
+    ) / 100
+    
+    params.consultants_pct = st.sidebar.slider(
+        "Consultants in Enterprise (%)",
+        5, 50, int(params.consultants_pct * 100), 5,
+        help="Percentage of enterprise customers who are consultancy firms."
+    ) / 100
+    
+    params.growers_in_platform_pct = st.sidebar.slider(
+        "Initial Growers in Platform (%)",
+        1, 50, int(params.growers_in_platform_pct * 100), 5,
+        help="Initial percentage of potential growers who join the platform at launch."
+    ) / 100
+    
+    # Add additional elasticity parameter
+    st.sidebar.subheader("Additional Elasticity Parameters")
+    params.lifetime_deal_elasticity = st.sidebar.slider(
+        "Lifetime Deal Elasticity",
+        -1.5, -0.1, params.lifetime_deal_elasticity, 0.1,
+        help="Price elasticity for lifetime deals. How sensitive demand is to lifetime deal pricing."
+    )
+    
+    # Add value perception parameters
+    st.sidebar.subheader("Value Perception")
+    params.enterprise_value_perception = st.sidebar.slider(
+        "Enterprise Value Perception",
+        0.1, 1.0, params.enterprise_value_perception, 0.05,
+        help="How highly enterprise users value the product (0.1=low, 1.0=high). Affects churn and willingness to pay."
+    )
+    
+    params.pro_value_perception = st.sidebar.slider(
+        "Pro Value Perception",
+        0.1, 1.0, params.pro_value_perception, 0.05,
+        help="How highly professional users value the product (0.1=low, 1.0=high). Affects churn and willingness to pay."
+    )
+    
+    # Add free-to-paid conversion rate
+    st.sidebar.subheader("Additional Conversion Parameters")
+    params.free_to_paid_rate = st.sidebar.slider(
+        "Free to Paid Conversion Rate",
+        0.01, 0.2, params.free_to_paid_rate, 0.01,
+        help="Percentage of free users who convert to paid accounts monthly."
+    )
+    
+    # Add advice parameters
+    params.avg_advice_price = st.sidebar.number_input(
+        "Average Advice Price ($)",
+        10, 200, int(params.avg_advice_price), 5,
+        help="Average price per advice transaction in the marketplace."
+    )
+    
+    params.avg_advice_frequency = st.sidebar.slider(
+        "Average Monthly Advice Transactions",
+        0.05, 1.0, params.avg_advice_frequency, 0.05,
+        help="Average number of advice transactions per user per month."
+    )
+    
+    # Add acquisition rate parameters to Advanced section
+    st.sidebar.subheader("Advanced Acquisition Parameters")
+    params.base_enterprise_acquisition_rate = st.sidebar.slider(
+        "Base Enterprise Acquisition Rate",
+        0.001, 0.1, params.base_enterprise_acquisition_rate, 0.001,
+        help="Monthly percentage of potential enterprise customers acquired without network effects."
+    )
+    
+    params.base_pro_acquisition_rate = st.sidebar.slider(
+        "Base Pro Acquisition Rate",
+        0.001, 0.1, params.base_pro_acquisition_rate, 0.001,
+        help="Monthly percentage of potential pro users acquired without network effects."
+    )
     
     # Cost structure parameters
     st.sidebar.subheader("Cost Structure")
