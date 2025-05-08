@@ -2,3 +2,5 @@ ortools
 matplotlib
 streamlit
 scipy
+pymoo
+plotly
