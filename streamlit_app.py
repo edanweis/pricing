@@ -3012,6 +3012,384 @@ with tab_multiobjective:
                             st.error(f"Error during optimization: {str(e)}")
                             st.exception(e)
 
+# Add interactive Pareto explorer section here
+if 'multi_obj_results' in st.session_state and hasattr(st.session_state.multi_obj_results.get('results', {}), 'X') and len(st.session_state.multi_obj_results['results'].X) > 0:
+    st.header("Interactive Pareto Explorer")
+    st.markdown("""
+    Explore the Pareto-optimal solutions using the controls below. Adjust the sliders to see how 
+    changes in one parameter affect the others along the Pareto front.
+    """)
+    
+    # Get data from the session state
+    res = st.session_state.multi_obj_results['results']
+    param_ranges = st.session_state.multi_obj_results['param_ranges']
+    selected_objectives = st.session_state.multi_obj_results['objectives']
+    
+    # Available objectives for display names
+    available_objectives = [
+        ("npv", "Net Present Value (NPV)"),
+        ("mrr", "Monthly Recurring Revenue (MRR)"),
+        ("ltv_cac", "LTV/CAC Ratio"),
+        ("gross_margin", "Gross Margin"),
+        ("enterprise_users", "Enterprise Users"),
+        ("pro_users", "Pro Users"),
+        ("consultants", "Consultants")
+    ]
+    
+    # Create dictionaries to store min/max values for parameters and objectives
+    param_min_values = {}
+    param_max_values = {}
+    obj_min_values = {}
+    obj_max_values = {}
+    
+    # Extract min/max values for parameters
+    for j, param_name in enumerate(param_ranges.keys()):
+        param_values = [float(res.X[i, j]) for i in range(len(res.X))]
+        param_min_values[param_name] = min(param_values)
+        param_max_values[param_name] = max(param_values)
+    
+    # Extract min/max values for objectives (negated for maximization)
+    for j, obj_name in enumerate(selected_objectives):
+        display_name = dict(available_objectives)[obj_name]
+        obj_values = [-float(res.F[i, j]) for i in range(len(res.F))]
+        obj_min_values[display_name] = min(obj_values)
+        obj_max_values[display_name] = max(obj_values)
+    
+    # Setting up driving/driven parameters
+    st.subheader("Set Driving and Driven Parameters")
+    st.markdown("""
+    Select which parameters/objectives you want to control manually (driving) and which 
+    ones should update automatically based on the nearest Pareto-optimal solution (driven).
+    """)
+    
+    # Create columns for parameters and objectives
+    param_col, obj_col = st.columns(2)
+    
+    # Initialize session state for driving status if not exists
+    if 'pareto_driving_status' not in st.session_state:
+        st.session_state.pareto_driving_status = {}
+        # Default: first parameter and objective are driving
+        for param_name in param_ranges.keys():
+            st.session_state.pareto_driving_status[param_name] = param_name == list(param_ranges.keys())[0]
+        
+        for obj_name in selected_objectives:
+            display_name = dict(available_objectives)[obj_name]
+            st.session_state.pareto_driving_status[display_name] = obj_name == selected_objectives[0]
+    
+    # Initialize session state for slider values if not exists
+    if 'pareto_slider_values' not in st.session_state:
+        st.session_state.pareto_slider_values = {}
+        
+        # Initialize with middle values of the Pareto front
+        for param_name in param_ranges.keys():
+            st.session_state.pareto_slider_values[param_name] = (param_min_values[param_name] + param_max_values[param_name]) / 2
+        
+        for obj_name in selected_objectives:
+            display_name = dict(available_objectives)[obj_name]
+            st.session_state.pareto_slider_values[display_name] = (obj_min_values[display_name] + obj_max_values[display_name]) / 2
+    
+    # Function to find closest Pareto solution
+    def find_closest_solution():
+        # Get all driving parameters and objectives
+        driving_params = {k: v for k, v in st.session_state.pareto_slider_values.items() 
+                        if k in param_ranges.keys() and st.session_state.pareto_driving_status[k]}
+        
+        driving_objs = {k: v for k, v in st.session_state.pareto_slider_values.items()
+                      if k not in param_ranges.keys() and st.session_state.pareto_driving_status[k]}
+        
+        if not driving_params and not driving_objs:
+            return  # No driving parameters or objectives
+        
+        # Calculate distance to each solution
+        distances = []
+        for i in range(len(res.X)):
+            distance = 0
+            
+            # Add distance component for each driving parameter
+            for param_name, value in driving_params.items():
+                j = list(param_ranges.keys()).index(param_name)
+                # Normalize by range
+                param_range = param_max_values[param_name] - param_min_values[param_name]
+                if param_range > 0:
+                    normalized_diff = (res.X[i, j] - value) / param_range
+                    distance += normalized_diff ** 2
+            
+            # Add distance component for each driving objective
+            for obj_display_name, value in driving_objs.items():
+                # Get the original objective name
+                obj_name = None
+                for orig_name, display in dict(available_objectives).items():
+                    if display == obj_display_name and orig_name in selected_objectives:
+                        obj_name = orig_name
+                        break
+                
+                if obj_name:
+                    j = selected_objectives.index(obj_name)
+                    # Normalize by range (remember objectives are negated)
+                    obj_range = obj_max_values[obj_display_name] - obj_min_values[obj_display_name]
+                    if obj_range > 0:
+                        normalized_diff = ((-res.F[i, j]) - value) / obj_range
+                        distance += normalized_diff ** 2
+            
+            distances.append(distance)
+        
+        # Find the closest solution
+        closest_idx = np.argmin(distances)
+        
+        # Update all driven parameters and objectives
+        for param_name in param_ranges.keys():
+            if not st.session_state.pareto_driving_status[param_name]:
+                j = list(param_ranges.keys()).index(param_name)
+                st.session_state.pareto_slider_values[param_name] = res.X[closest_idx, j]
+        
+        for obj_name in selected_objectives:
+            display_name = dict(available_objectives)[obj_name]
+            if not st.session_state.pareto_driving_status[display_name]:
+                j = selected_objectives.index(obj_name)
+                st.session_state.pareto_slider_values[display_name] = -res.F[closest_idx, j]
+    
+    # Callback for slider changes
+    def on_slider_change():
+        find_closest_solution()
+    
+    # Parameter driving/driven selection
+    with param_col:
+        st.subheader("Parameters")
+        for param_name in param_ranges.keys():
+            st.session_state.pareto_driving_status[param_name] = st.radio(
+                f"{param_name}",
+                ["Driving", "Driven"],
+                index=0 if st.session_state.pareto_driving_status.get(param_name, False) else 1,
+                horizontal=True,
+                key=f"param_status_{param_name}"
+            ) == "Driving"
+    
+    # Objective driving/driven selection
+    with obj_col:
+        st.subheader("Objectives")
+        for obj_name in selected_objectives:
+            display_name = dict(available_objectives)[obj_name]
+            st.session_state.pareto_driving_status[display_name] = st.radio(
+                f"{display_name}",
+                ["Driving", "Driven"],
+                index=0 if st.session_state.pareto_driving_status.get(display_name, False) else 1,
+                horizontal=True,
+                key=f"obj_status_{display_name}"
+            ) == "Driving"
+    
+    # Count total parameters/objectives and how many are set as driving
+    total_vars = len(param_ranges) + len(selected_objectives)
+    driving_vars = sum(1 for k, v in st.session_state.pareto_driving_status.items() if v)
+    driven_vars = total_vars - driving_vars
+    
+    # Maximum allowed driving variables - leave at least one degree of freedom
+    max_driving = total_vars - 1
+    
+    # Check if we have over-constrained the problem
+    if driven_vars < 1:
+        st.warning(f"""
+        **Over-constrained problem**: You've set {driving_vars} out of {total_vars} variables as driving.
+        This leaves no degrees of freedom for the Pareto front exploration.
+        
+        Please set at least one parameter or objective as 'Driven' to continue.
+        """)
+        
+        # Force at least one parameter to be driven (e.g., the last one)
+        if param_ranges:
+            last_param = list(param_ranges.keys())[-1]
+            st.session_state.pareto_driving_status[last_param] = False
+            st.info(f"Automatically setting '{last_param}' as driven to maintain feasibility.")
+    
+    # Create sliders for driving parameters and objectives
+    st.subheader("Driving Controls")
+    
+    # Parameters first
+    for param_name in param_ranges.keys():
+        if st.session_state.pareto_driving_status[param_name]:  # If driving
+            st.slider(
+                f"{param_name}",
+                min_value=float(param_min_values[param_name]),
+                max_value=float(param_max_values[param_name]),
+                value=float(st.session_state.pareto_slider_values[param_name]),
+                key=f"slider_{param_name}",
+                on_change=on_slider_change
+            )
+            # Update the session state
+            st.session_state.pareto_slider_values[param_name] = st.session_state[f"slider_{param_name}"]
+    
+    # Then objectives
+    for obj_name in selected_objectives:
+        display_name = dict(available_objectives)[obj_name]
+        if st.session_state.pareto_driving_status[display_name]:  # If driving
+            st.slider(
+                f"{display_name}",
+                min_value=float(obj_min_values[display_name]),
+                max_value=float(obj_max_values[display_name]),
+                value=float(st.session_state.pareto_slider_values[display_name]),
+                key=f"slider_{display_name}",
+                on_change=on_slider_change
+            )
+            # Update the session state
+            st.session_state.pareto_slider_values[display_name] = st.session_state[f"slider_{display_name}"]
+    
+    # Update the driven values
+    if driving_vars > 0:  # Only try to find solution if there are driving variables
+        # Store original driving values for comparison
+        original_driving_values = {}
+        for param_name in param_ranges.keys():
+            if st.session_state.pareto_driving_status[param_name]:
+                original_driving_values[param_name] = st.session_state.pareto_slider_values[param_name]
+        
+        for obj_name in selected_objectives:
+            display_name = dict(available_objectives)[obj_name]
+            if st.session_state.pareto_driving_status[display_name]:
+                original_driving_values[display_name] = st.session_state.pareto_slider_values[display_name]
+        
+        # Find closest solution
+        find_closest_solution()
+        
+        # Show how close we got to the desired driving values
+        if driving_vars > 1:  # Only show deviation if we're attempting to drive multiple variables
+            st.subheader("Driving Value Accuracy")
+            st.markdown("""
+            When driving multiple parameters/objectives simultaneously, the actual values may 
+            deviate from your desired settings to stay on the Pareto front.
+            Below is how close we got to your requested values:
+            """)
+            
+            accuracy_cols = st.columns(min(3, driving_vars))
+            accuracy_idx = 0
+            
+            # Calculate deviations for parameters
+            for param_name in param_ranges.keys():
+                if st.session_state.pareto_driving_status[param_name]:
+                    requested = original_driving_values[param_name]
+                    actual = st.session_state.pareto_slider_values[param_name]
+                    deviation = ((actual - requested) / requested) * 100 if requested != 0 else 0
+                    
+                    with accuracy_cols[accuracy_idx % len(accuracy_cols)]:
+                        st.metric(
+                            f"{param_name}",
+                            f"{actual:.2f}",
+                            f"{deviation:.1f}% from requested"
+                        )
+                    accuracy_idx += 1
+            
+            # Calculate deviations for objectives
+            for obj_name in selected_objectives:
+                display_name = dict(available_objectives)[obj_name]
+                if st.session_state.pareto_driving_status[display_name]:
+                    requested = original_driving_values[display_name]
+                    actual = st.session_state.pareto_slider_values[display_name]
+                    deviation = ((actual - requested) / requested) * 100 if requested != 0 else 0
+                    
+                    with accuracy_cols[accuracy_idx % len(accuracy_cols)]:
+                        st.metric(
+                            f"{display_name}",
+                            f"{actual:.2f}",
+                            f"{deviation:.1f}% from requested"
+                        )
+                    accuracy_idx += 1
+    
+    # Create metrics for the driven parameters and objectives
+    st.subheader("Driven Values")
+    
+    # Create columns for better layout
+    cols = st.columns(3)
+    col_idx = 0
+    
+    # Display driven parameters
+    for param_name in param_ranges.keys():
+        if not st.session_state.pareto_driving_status[param_name]:  # If driven
+            with cols[col_idx % 3]:
+                st.metric(
+                    f"{param_name}",
+                    f"{st.session_state.pareto_slider_values[param_name]:.2f}"
+                )
+            col_idx += 1
+    
+    # Display driven objectives
+    for obj_name in selected_objectives:
+        display_name = dict(available_objectives)[obj_name]
+        if not st.session_state.pareto_driving_status[display_name]:  # If driven
+            with cols[col_idx % 3]:
+                st.metric(
+                    f"{display_name}",
+                    f"{st.session_state.pareto_slider_values[display_name]:.2f}"
+                )
+            col_idx += 1
+    
+    # Add a reset button
+    if st.button("Reset Pareto Explorer"):
+        # Reset driving status
+        for key in st.session_state.pareto_driving_status:
+            st.session_state.pareto_driving_status[key] = False
+        
+        # First parameter and objective as driving by default
+        if param_ranges:
+            st.session_state.pareto_driving_status[list(param_ranges.keys())[0]] = True
+        
+        if selected_objectives:
+            display_name = dict(available_objectives)[selected_objectives[0]]
+            st.session_state.pareto_driving_status[display_name] = True
+        
+        # Reset slider values to midpoint
+        for param_name in param_ranges.keys():
+            st.session_state.pareto_slider_values[param_name] = (param_min_values[param_name] + param_max_values[param_name]) / 2
+        
+        for obj_name in selected_objectives:
+            display_name = dict(available_objectives)[obj_name]
+            st.session_state.pareto_slider_values[display_name] = (obj_min_values[display_name] + obj_max_values[display_name]) / 2
+        
+        st.rerun()
+    
+    # Add explanation of how to use the explorer
+    with st.expander("How to Use the Pareto Explorer", expanded=False):
+        st.markdown("""
+        ### Using the Interactive Pareto Explorer
+        
+        1. **Select driving/driven parameters:**
+           - **Driving**: Parameters/objectives you want to control manually with sliders
+           - **Driven**: Parameters/objectives that will update based on the nearest Pareto-optimal solution
+        
+        2. **Move the sliders** for driving parameters/objectives to see how the driven values change
+        
+        3. **Experiment with different combinations** to understand trade-offs
+        
+        4. **Reset the explorer** if you want to start over with default settings
+        
+        This explorer helps you understand the trade-offs between different objectives in your pricing strategy.
+        For example, you can see how increasing Enterprise Price affects NPV and LTV/CAC ratio.
+        """)
+        
+        st.markdown("""
+        ### Best Practices for Pareto Exploration
+        
+        **Over-constraining**: The Pareto front represents the set of optimal trade-offs. When you set too many 
+        parameters/objectives as "driving", the system may not be able to find a point on the Pareto front that 
+        matches all your desired values simultaneously.
+        
+        **Recommendations:**
+        
+        - **Optimal approach**: Drive only 1-2 parameters/objectives at a time for the most insightful exploration
+        - **Accuracy feedback**: When driving multiple variables, check the "Driving Value Accuracy" section to see how close the solution is to your requested values
+        - **Be cautious** with highly conflicting objectives (like maximizing both profit margin and user growth)
+        
+        **Mathematical intuition**: For a K-dimensional Pareto front, you can freely specify at most K-1 parameters while staying on the front. The remaining parameters are determined by the Pareto-optimality constraint.
+        """)
+        
+        st.markdown("""
+        ### Advanced Strategy Exploration
+        
+        Try these exploration approaches to gain deeper insights:
+        
+        1. **Sensitivity analysis**: Set one parameter as driving and cycle through different values to see how sensitive other metrics are to changes
+        
+        2. **Trade-off visualization**: Set two conflicting objectives (e.g., MRR and LTV/CAC) as driven, then manipulate different parameters to see how they impact the trade-off
+        
+        3. **Objective prioritization**: Set your most important objective as driving at a high value, then see what parameter values are required to achieve it
+        """)
+
 # Footer
 st.markdown("---")
 st.markdown("Built with Streamlit and OR-Tools for advanced pricing optimization with network effects.")
